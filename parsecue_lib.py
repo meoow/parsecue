@@ -15,6 +15,14 @@ import copy
 
 ENCODING_LIST = ('utf-8','cp936', 'euc-kr', 'shift-jis', 'big5')
 
+def slicein(sub, lst):
+	if len(sub) > len(lst):
+		return False
+	if sub == lst[:len(sub)]:
+		return True
+	else:
+		return slicein(sub, lst[1:])
+
 def parsDiscNum(title):
 	ptn1 = r'(?<=[^\w]| )\[dis[ck](?:\s+)?(\d+|[A-Z])\]$'
 	ptn2 = r'(?<=[^\w]| )dis[ck](?:\s+)?(\d+|[A-Z])$'
@@ -58,6 +66,15 @@ def duration2secs(timestr, return_dt=False):
 			return str(dt.total_seconds())
 
 	raise ValueError('Invalid duration string: {}'.format(timestr))
+
+def avgTimePoint(a, b):
+	aa = a.split(':')
+	bb = b.split(':')
+	cc = [0, 0, 0]
+	for idx, (x, y) in enumerate(izip(aa, bb)):
+		cc[idx] = (int(y) + int(x))/2
+	return ':'.join(str(i) for i in cc)
+
 
 def parsecue(cuefile):
 
@@ -143,6 +160,7 @@ def parsecue(cuefile):
 
 	if 'tracktotal' not in output:
 		output['tracktotal'] = len(output['tracks'])
+	output['slashtracktotal'] = '/{0}'.format(output['tracktotal'])
 
 	return output
 
@@ -161,6 +179,8 @@ def metadata(cue, idx):
 	cmd = [
 	u'title={0}'.format(i.get('title', "")), 
 	u'artist={0}'.format(i.get('artist', cue.get('artist', i.get('performer', cue.get('performer', ''))))),
+	u'author={0}'.format(i.get('artist', cue.get('artist', i.get('performer', cue.get('performer', ''))))),
+	u'album_artist={0}'.format(cue.get('artist', i.get('artist', i.get('performer', cue.get('performer', ''))))),
 	u'performer={0}'.format(i.get('performer', cue.get('performer', ''))),
 	u'album={0}'.format(i.get('album', cue.get('album', ''))), 
 	u'year={0}'.format(i.get('year', cue.get('year', cue.get('date', '').split('/')[0]))), 
@@ -174,44 +194,12 @@ def metadata(cue, idx):
 	u'discid={0}'.format(i.get('discid', '')), 
 	u'disctotal={0}'.format(cue.get('disctotal', '')), 
 	u'totaldiscs={0}'.format(cue.get('disctotal', '')), 
-	 u'album_artist={0}'.format(cue.get('artist', '')), 
 	 u'composer={0}'.format(i.get('composer', cue.get('composer', '')))
 	]
 	return [ b for a in (('-metadata',x) for x in cmd if re.match(r'^[^=]+=$', x) is None ) for b in a ]+['-metadata', 'cuesheet=']
 
-def ffmpeg(cue, encoderArgs, extname):
-
-	if not os.path.isfile(cue['filename']):
-		raise IOError("Can't not find file")
-
-	fstat = os.stat(cue['filename'])
-	atime = fstat.st_atime
-	mtime = fstat.st_mtime
-	
-	cmds = []
-	outputs = []
-
-	for idx,i in cue['tracks'].iteritems():
-		cmd = ['ffmpeg', '-y', '-hide_banner']
-		output = re.sub('[/\?\'"]','_',cue.get('disc', '')+idx+' - '+i.get('title', ''))+'.'+extname.lstrip('. ')
-		i = cue['tracks'][idx]
-		s_n = ts1(cue, idx)
-		start_dt = duration2secs(s_n[0], True)
-		end_dt = duration2secs(s_n[1], True)
-		dura = str((end_dt - start_dt).total_seconds())
-		cmd.extend(['-ss', s_n[0], '-i', cue['filename'], '-ss', '0', '-t', dura]+encoderArgs+metadata(cue, idx)+[output])
-
-		subp.check_call(cmd)
-		os.utime(output, (atime, mtime))
-
 def ffmpeg_mt(cue, encoderArgs, extname):
 
-	afidx=-1
-	for c,i in enumerate(encoderArgs):
-		if i in ['-filter:a', '-af']:
-			afidx = c+1
-			break
-
 	if not os.path.isfile(cue['filename']):
 		raise IOError("Can't not find file")
 
@@ -219,26 +207,31 @@ def ffmpeg_mt(cue, encoderArgs, extname):
 	atime = fstat.st_atime
 	mtime = fstat.st_mtime
 	
-	cmds = []
-	outputs = []
+	for ids in (cue['tracks'].keys()[i:i+8] for i in range(0,len(cue['tracks']),8)):
+		cmds = []
+		outputs = []
+		cmd = ['ffmpeg', '-y', '-hide_banner', '-f', 'lavfi', '-i', 'aevalsrc=0|0:d=1:s=44100,aformat=sample_fmts=s16,atrim=start=0:end=0.333', '-i', cue['filename']]
+		for idx in ids:
+			i = cue['tracks'][idx]
+			enc = copy.copy(encoderArgs)
+			output = re.sub('[/\?\'"]','_',cue.get('disc', '')+idx+' - '+i.get('title', ''))+'.'+extname.lstrip('. ')
+			s0, e0 = ts0(cue, idx)
+			s1, e1 = ts1(cue, idx)
+			start_dt  = (duration2secs(s1, True) - duration2secs(s0, True)) / 3 * 2 + duration2secs(s0, True)
+			end_dt = duration2secs(e1, True)
+			atrim = '[1:a]atrim=start={0}:end={1}[a0];[a0]silenceremove=1:0:-82dB:1:1:-82dB[a1];[0][a1]concat=n=2:a=1:v=0[astream]'.format(start_dt.total_seconds(), end_dt.total_seconds())
+			enc = ['-lavfi', atrim, '-map', '[astream]']+enc
+			cmd.extend(enc+metadata(cue, idx))
+			cmd.append(output)
+			outputs.append(output)
 
-	cmd = ['ffmpeg', '-y', '-hide_banner', '-i', cue['filename']]
-	for idx,i in cue['tracks'].iteritems():
-		enc = copy.copy(encoderArgs)
-		output = re.sub('[/\?\'"]','_',cue.get('disc', '')+idx+' - '+i.get('title', ''))+'.'+extname.lstrip('. ')
-		i = cue['tracks'][idx]
-		s_n = ts1(cue, idx)
-		start_dt = duration2secs(s_n[0], True).total_seconds()
-		end_dt = duration2secs(s_n[1], True).total_seconds()
-		atrim = 'atrim=start={0}:end={1}'.format(start_dt, end_dt)
-		if afidx==-1:
-			enc = ['-af', atrim]+enc
-		else:
-			enc[afidx] = atrim+','+enc[afidx]
-		cmd.extend(enc+metadata(cue, idx))
-		cmd.append(output)
-		outputs.append(output)
+		if extname == "m4a" or slicein(['-f', 'ipod'], cmd):
+			trackptn = re.compile(r'^track=\d+$')
+			for idx, i in enumerate(cmd):
+				if i == '-metadata' and trackptn.match(cmd[idx+1]):
+					cmd[idx+1] = cmd[idx+1]+cue['slashtracktotal']
 
-	subp.check_call(cmd)
-	for o in outputs:
-		os.utime(o, (atime, mtime))
+		subp.check_call(cmd)
+		for o in outputs:
+			os.utime(o, (atime, mtime))
+
